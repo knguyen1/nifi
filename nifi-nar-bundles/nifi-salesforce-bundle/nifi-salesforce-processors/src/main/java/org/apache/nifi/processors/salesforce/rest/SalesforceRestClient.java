@@ -16,18 +16,27 @@
  */
 package org.apache.nifi.processors.salesforce.rest;
 
+import org.apache.nifi.proxy.ProxyConfiguration;
+import org.apache.nifi.ssl.SSLContextService;
+
+import okhttp3.Credentials;
 import okhttp3.HttpUrl;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
+
 import org.apache.nifi.processor.exception.ProcessException;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
+import java.net.Proxy;
 import java.util.concurrent.TimeUnit;
+
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.X509TrustManager;
 
 public class SalesforceRestClient {
 
@@ -36,11 +45,83 @@ public class SalesforceRestClient {
     private final SalesforceConfiguration configuration;
     private final OkHttpClient httpClient;
 
+    /**
+     * Constructs a new SalesforceRestClient using the provided SalesforceConfiguration
+     * and defaults for ProxyConfiguration, SSLContextService, and HttpProtocolStrategy
+     * as null. This constructor is suitable for simple cases where proxy configuration,
+     * SSL context service, and HTTP protocol strategy are not required.
+     *
+     * @param configuration The configuration settings for Salesforce. This must not be null.
+     */
     public SalesforceRestClient(SalesforceConfiguration configuration) {
-        this.configuration = configuration;
-        httpClient = new OkHttpClient.Builder()
-                .readTimeout(configuration.getResponseTimeoutMillis(), TimeUnit.MILLISECONDS)
-                .build();
+        this(configuration, null, null, null);
+    }
+
+    /**
+     * Constructs a new SalesforceRestClient using the provided configurations. 
+     * This constructor allows for greater control and should be used when the client
+     * requires specific proxy configuration, SSL context, or HTTP protocol strategy.
+     *
+     * @param configuration         The configuration settings for Salesforce. This must not be null.
+     * @param proxyConfiguration    The proxy configuration. This can be null if no proxy is used.
+     * @param sslContext            The SSL context service. This can be null if SSL context is not required.
+     * @param httpProtocolStrategy  The HTTP protocol strategy. This can be null if a specific strategy is not required.
+     */
+    public SalesforceRestClient(final SalesforceConfiguration configuration,
+        final ProxyConfiguration proxyConfiguration,
+        final SSLContextService sslContext,
+        final HttpProtocolStrategy httpProtocolStrategy) {
+            this.configuration = configuration;
+            this.httpClient = initializeHttpClient(proxyConfiguration, sslContext, httpProtocolStrategy);
+    }
+
+    /**
+     * Initializes an OkHttpClient instance using the provided ProxyConfiguration, SSLContextService,
+     * and HttpProtocolStrategy. The method configures the OkHttpClient instance with read timeout,
+     * SSL socket factory, proxy, and HTTP protocols.
+     *
+     * If the SSLContextService, ProxyConfiguration, or HttpProtocolStrategy instances are null, this method
+     * will skip the respective configurations.
+     *
+     * @param proxyConfiguration  The proxy configuration. Can be null.
+     * @param sslService          The SSL context service. Can be null.
+     * @param httpProtocolStrategy The HTTP protocol strategy. Can be null.
+     * @return Returns a fully configured OkHttpClient instance.
+     */
+    private OkHttpClient initializeHttpClient(final ProxyConfiguration proxyConfiguration,
+        final SSLContextService sslService,
+        final HttpProtocolStrategy httpProtocolStrategy) {
+        final OkHttpClient.Builder clientBuilder = new OkHttpClient.Builder();
+
+        // set the default timeout
+        clientBuilder.readTimeout(configuration.getResponseTimeoutMillis(), TimeUnit.MILLISECONDS);
+
+        // pass the ssl service to client builder if provided
+        if (sslService != null) {
+            final X509TrustManager trustManager = sslService.createTrustManager();
+            final SSLContext sslContext = sslService.createContext();
+            clientBuilder.sslSocketFactory(sslContext.getSocketFactory(), trustManager);
+        }
+
+        if (proxyConfiguration != null) {
+            final Proxy proxy = proxyConfiguration.createProxy();
+            if (!Proxy.Type.DIRECT.equals(proxy.type())) {
+                clientBuilder.proxy(proxy);
+
+                if (proxyConfiguration.hasCredential()) {
+                    clientBuilder.proxyAuthenticator((route, response) -> {
+                        final String credential = Credentials.basic(proxyConfiguration.getProxyUserName(), proxyConfiguration.getProxyUserPassword());
+                        return response.request().newBuilder()
+                            .header("Proxy-Authorization", credential)
+                            .build();
+                    });
+                }
+            }
+        }
+
+        if (httpProtocolStrategy != null) clientBuilder.protocols(httpProtocolStrategy.getProtocols());
+
+        return clientBuilder.build();
     }
 
     public InputStream describeSObject(String sObject) {

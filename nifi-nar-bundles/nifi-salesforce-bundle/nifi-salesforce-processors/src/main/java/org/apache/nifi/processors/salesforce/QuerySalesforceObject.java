@@ -16,12 +16,32 @@
  */
 package org.apache.nifi.processors.salesforce;
 
-import com.fasterxml.jackson.core.JsonEncoding;
-import com.fasterxml.jackson.core.JsonFactory;
-import com.fasterxml.jackson.core.JsonGenerator;
-import com.fasterxml.jackson.core.JsonParser;
-import com.fasterxml.jackson.core.JsonToken;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import static org.apache.nifi.processors.salesforce.util.CommonSalesforceProperties.API_VERSION;
+import static org.apache.nifi.processors.salesforce.util.CommonSalesforceProperties.READ_TIMEOUT;
+import static org.apache.nifi.processors.salesforce.util.CommonSalesforceProperties.SALESFORCE_INSTANCE_URL;
+import static org.apache.nifi.processors.salesforce.util.CommonSalesforceProperties.TOKEN_PROVIDER;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.UncheckedIOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiPredicate;
+import java.util.stream.Collectors;
+
 import org.apache.camel.component.salesforce.api.dto.SObjectDescription;
 import org.apache.camel.component.salesforce.api.dto.SObjectField;
 import org.apache.nifi.annotation.behavior.InputRequirement;
@@ -55,6 +75,7 @@ import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.io.OutputStreamCallback;
 import org.apache.nifi.processor.util.StandardValidators;
+import org.apache.nifi.processors.salesforce.rest.HttpProtocolStrategy;
 import org.apache.nifi.processors.salesforce.rest.SalesforceConfiguration;
 import org.apache.nifi.processors.salesforce.rest.SalesforceRestClient;
 import org.apache.nifi.processors.salesforce.schema.SalesforceSchemaHolder;
@@ -62,6 +83,8 @@ import org.apache.nifi.processors.salesforce.schema.SalesforceToRecordSchemaConv
 import org.apache.nifi.processors.salesforce.util.IncrementalContext;
 import org.apache.nifi.processors.salesforce.util.SalesforceQueryBuilder;
 import org.apache.nifi.processors.salesforce.validator.SalesforceAgeValidator;
+import org.apache.nifi.proxy.ProxyConfiguration;
+import org.apache.nifi.proxy.ProxySpec;
 import org.apache.nifi.scheduling.SchedulingStrategy;
 import org.apache.nifi.schema.access.SchemaNotFoundException;
 import org.apache.nifi.serialization.MalformedRecordException;
@@ -73,33 +96,15 @@ import org.apache.nifi.serialization.record.Record;
 import org.apache.nifi.serialization.record.RecordField;
 import org.apache.nifi.serialization.record.RecordFieldType;
 import org.apache.nifi.serialization.record.RecordSchema;
+import org.apache.nifi.ssl.SSLContextService;
 import org.apache.nifi.util.StringUtils;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.io.UncheckedIOException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.BiPredicate;
-import java.util.stream.Collectors;
-
-import static org.apache.nifi.processors.salesforce.util.CommonSalesforceProperties.API_VERSION;
-import static org.apache.nifi.processors.salesforce.util.CommonSalesforceProperties.READ_TIMEOUT;
-import static org.apache.nifi.processors.salesforce.util.CommonSalesforceProperties.SALESFORCE_INSTANCE_URL;
-import static org.apache.nifi.processors.salesforce.util.CommonSalesforceProperties.TOKEN_PROVIDER;
+import com.fasterxml.jackson.core.JsonEncoding;
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 @TriggerSerially
 @InputRequirement(Requirement.INPUT_ALLOWED)
@@ -222,6 +227,26 @@ public class QuerySalesforceObject extends AbstractProcessor {
             .dependsOn(QUERY_TYPE, PROPERTY_BASED_QUERY)
             .build();
 
+    private static final ProxySpec[] PROXY_SPECS = {ProxySpec.HTTP_AUTH, ProxySpec.SOCKS};
+
+    private static final PropertyDescriptor PROXY_CONFIGURATION_SERVICE = ProxyConfiguration.createProxyConfigPropertyDescriptor(true, PROXY_SPECS);
+
+    public static final PropertyDescriptor SSL_CONTEXT_SERVICE = new PropertyDescriptor.Builder()
+            .name("SSL Context Service")
+            .description("SSL Context Service provides trusted certificates and client certificates for TLS communication.")
+            .required(false)
+            .identifiesControllerService(SSLContextService.class)
+            .build();
+
+    public static final PropertyDescriptor HTTP_PROTOCOL_STRATEGY = new PropertyDescriptor.Builder()
+            .name("HTTP Protocols")
+            .description("HTTP Protocols supported for Application Layer Protocol Negotiation with TLS")
+            .required(false)
+            .allowableValues(HttpProtocolStrategy.class)
+            .defaultValue(HttpProtocolStrategy.H2_HTTP_1_1.getValue())
+            .dependsOn(SSL_CONTEXT_SERVICE)
+            .build();
+
     static final PropertyDescriptor CUSTOM_WHERE_CONDITION = new PropertyDescriptor.Builder()
             .name("custom-where-condition")
             .displayName("Custom WHERE Condition")
@@ -291,7 +316,11 @@ public class QuerySalesforceObject extends AbstractProcessor {
                 context.getProperty(READ_TIMEOUT).evaluateAttributeExpressions().asTimePeriod(TimeUnit.MILLISECONDS).intValue()
         );
 
-        salesforceRestService = new SalesforceRestClient(salesforceConfiguration);
+        final ProxyConfiguration proxyConfig = ProxyConfiguration.getConfiguration(context);
+        final SSLContextService sslService = context.getProperty(SSL_CONTEXT_SERVICE).asControllerService(SSLContextService.class);
+        final HttpProtocolStrategy httpProtocolStrategy = HttpProtocolStrategy.valueOf(context.getProperty(HTTP_PROTOCOL_STRATEGY).getValue());
+
+        salesforceRestService = new SalesforceRestClient(salesforceConfiguration, proxyConfig, sslService, httpProtocolStrategy);
     }
 
     private static final List<PropertyDescriptor> PROPERTIES = Collections.unmodifiableList(Arrays.asList(
@@ -308,7 +337,9 @@ public class QuerySalesforceObject extends AbstractProcessor {
             CUSTOM_WHERE_CONDITION,
             READ_TIMEOUT,
             CREATE_ZERO_RECORD_FILES,
-            TOKEN_PROVIDER
+            TOKEN_PROVIDER,
+            PROXY_CONFIGURATION_SERVICE,
+            SSL_CONTEXT_SERVICE
     ));
 
     private static final Set<Relationship> RELATIONSHIPS = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(

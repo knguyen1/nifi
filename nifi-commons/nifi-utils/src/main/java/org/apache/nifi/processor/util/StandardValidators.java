@@ -17,6 +17,7 @@
 package org.apache.nifi.processor.util;
 
 import java.io.File;
+import java.net.IDN;
 import java.net.URI;
 import java.nio.charset.Charset;
 import java.nio.charset.UnsupportedCharsetException;
@@ -167,6 +168,48 @@ public class StandardValidators {
                 return new ValidationResult.Builder().subject(subject).input(input).explanation("Expression Language Present").valid(true).build();
             }
             return StandardValidators.NON_EMPTY_VALIDATOR.validate(subject, input, context);
+        }
+    };
+
+    private static boolean isValidHostname(String hostname) {
+        if (hostname.length() > 255) return false;
+
+        if (hostname.endsWith("."))
+            hostname = hostname.substring(0, hostname.length() - 1); // strip exactly one dot from the right, if present
+
+        Pattern allowed = Pattern.compile("(?!-)[A-Z\\d-]{1,63}(?<!-)$", Pattern.CASE_INSENSITIVE);
+        return Arrays.stream(hostname.split("\\.")).allMatch(s -> allowed.matcher(s).matches());
+    }
+
+    /**
+     * This class represents a hostname validator implementing the Validator interface.
+     * The validator uses a simplified way to validate hostname strings by checking the length, 
+     * ensuring no trailing periods, and matching to a specified regular expression.
+     * see: https://stackoverflow.com/questions/2532053/validate-a-hostname-string
+     *
+     * @see Validator
+     */
+    public static final Validator HOSTNAME_VALIDATOR = new Validator() {
+        /**
+         * Validates a provided hostname string in a particular validation context.
+         * If the hostname string is valid, it returns a ValidationResult with valid set to true.
+         * If the hostname string is invalid, it returns a ValidationResult with valid set to false.
+         *
+         * @param subject  The subject of validation, usually the name or type of the data being validated.
+         * @param input    The hostname string to validate.
+         * @param context  The context of validation, providing additional information needed for validation.
+         * @return         A ValidationResult that includes the subject, input, validation result (valid/invalid), and an explanation.
+         */
+        @Override
+        public ValidationResult validate(String subject, String input, ValidationContext context) {
+            final boolean isValid = isValidHostname(input);
+            return new ValidationResult
+                .Builder()
+                .subject(subject)
+                .input(input)
+                .valid(isValid)
+                .explanation(isValid ? "Valid hostname" : "Invalid hostname")
+                .build();
         }
     };
 
